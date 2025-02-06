@@ -85,11 +85,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
-
-    https://kellerjordan.github.io/posts/muon/
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
@@ -97,74 +97,102 @@ class Muon(torch.optim.Optimizer):
     the advantage that it can be stably run in bfloat16 on the GPU.
 
     Some warnings:
-    - This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe this optimizer is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
 
     Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
+        muon_params: The parameters to be optimized by Muon.
+        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
+        momentum: The momentum used by the internal SGD. (0.95 is a good default)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
-        self.rank = rank
-        self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: list[Tensor] = [*params]
-        param_groups = []
-        for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            group = dict(params=[p for p in params if p.numel() == size],
-                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
-            param_groups.append(group)
-        super().__init__(param_groups, defaults)
+    def __init__(self, muon_params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=6,
+                 adamw_params=None, adamw_lr=3e-4, adamw_betas=(0.95, 0.95), adamw_eps=1e-8, adamw_wd=0):
 
-    @torch.no_grad()
-    def step(self):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        adamw_lr_ratio=adamw_lr/lr, adamw_betas=adamw_betas,
+                        adamw_eps=adamw_eps, adamw_wd=adamw_wd)
+
+        params = list(muon_params)
+        super().__init__(params, defaults)
+        if 'WORLD_SIZE' in os.environ:
+            self.world_size = int(os.environ['WORLD_SIZE'])
+            self.rank = int(os.environ['RANK'])
+        else:
+            self.world_size = 1
+            self.rank = 0
+
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
-            handle = None
-            params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world),
-                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
 
-            for base_i in range(len(params))[::self.world_size]:
+            ############################
+            #           Muon           #
+            ############################
+
+            params = group['params']
+            lr = group['lr']
+            momentum = group['momentum']
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in params)
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i in len(range(params))[::self.world_size]:
                 # every device will be responsible for a different param, but all devices need to share their shards and participate here
                 grads = [None] * self.world_size
-                for i in range(self.world_size):
-                    if base_i + i < len(params):
-                        grads[i] = to_local(params[base_i + i].grad, keep_sharded=False)[0]
-                        if not i == self.rank:
-                            grads[i] = None
+                for j in range(self.world_size):
+                    if i + j < len(params):
+                        # all devices participate in gather
+                        grads[j] = to_local(params[i + j].grad, keep_sharded=False)[0]
+                        # but only one device is responsible for the update
+                        if not j == self.rank:
+                            grads[j] = None
 
-                # gradient is fully materialized, do the whitening
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+                if i + self.rank < len(params):
                     g = grads[self.rank]
+                    if g is None:
+                        continue
+                    if g.ndim > 2:
+                        g = g.view(g.size(0), -1)
                     assert g is not None
                     state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    if g.ndim == 4: # for the case of conv filters
-                        g = g.view(len(g), -1)
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
-                else:
-                    g = update_buffer_views[self.rank]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    else:
+                        g = buf
+                    g = zeropower_via_newtonschulz5(g, steps=group['ns_steps'])
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
 
-                # shard the update
 
-                if base_i > 0:
-                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in params:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
+
+        return loss
+
+
